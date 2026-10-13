@@ -45,3 +45,34 @@ def tokens_per_watt(total_tokens: int, wh: float, seconds: float = 1.0) -> float
     """Energy efficiency of serving: tokens per watt (higher is better)."""
     watts = (wh * 3600.0) / seconds if seconds > 0 else 0.0
     return total_tokens / watts if watts > 0 else 0.0
+
+
+# --- Extension 5: carbon-aware scheduling -------------------------------------------
+PUE = 1.0  # ASSUMPTION: board power only (PUE ignored); multiply by ~1.1-1.4 for facility overhead
+
+
+def job_energy_wh(watts: float, num_gpus: float, hours_per_day: float, days: float) -> float:
+    """Energy of a job at full board power (ASSUMPTION: GPUs draw rated TDP while running)."""
+    return watts * num_gpus * hours_per_day * days * PUE
+
+
+def region_comparison(wh: float) -> list:
+    """Same energy in every region: grid intensity, $/kWh, electricity cost and carbon (sorted by carbon)."""
+    rows = [{"region": r, "gco2_kwh": REGION_CARBON[r], "usd_kwh": REGION_PRICE_KWH[r],
+             "carbon_g": carbon_g(wh, r), "energy_usd": energy_cost_usd(wh, r)} for r in REGION_CARBON]
+    return sorted(rows, key=lambda x: x["carbon_g"])
+
+
+def cleanest_region() -> str:
+    return min(REGION_CARBON, key=REGION_CARBON.get)
+
+
+def cheapest_region() -> str:
+    return min(REGION_PRICE_KWH, key=REGION_PRICE_KWH.get)
+
+
+def balanced_region(carbon_weight: float = 0.5) -> str:
+    """Lowest weighted sum of carbon and price, each normalised to the worst region (0..1)."""
+    max_c, max_p = max(REGION_CARBON.values()), max(REGION_PRICE_KWH.values())
+    return min(REGION_CARBON, key=lambda r: carbon_weight * REGION_CARBON[r] / max_c
+               + (1 - carbon_weight) * REGION_PRICE_KWH[r] / max_p)
