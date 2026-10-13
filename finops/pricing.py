@@ -4,6 +4,7 @@ Figures are June-2026 as-of snapshots from the deck's RESEARCH dossier; treat
 live prices as fast-moving (re-baseline before each cohort).
 """
 from __future__ import annotations
+import math
 
 
 def request_cost(
@@ -60,21 +61,89 @@ def break_even_utilization(discount_frac: float) -> float:
     return max(0.0, min(1.0, 1.0 - discount_frac))
 
 
-def recommend_tier(hours_per_day: float, interruptible: bool, reserved_discount: float = 0.45) -> str:
+# --- Extension 1: tier policy inputs -------------------------------------------------
+# Per-hour chance a spot GPU is reclaimed. ASSUMPTION: mapped from the AWS Spot Instance
+# Advisor "frequency of interruption" buckets (<5%, 5-10%, 10-15% per month of instances,
+# here read as a per-hour rate for the simulation) and the deck note that H100 spot is
+# reclaimed less often than A10G. Scarce, newest SKUs sit in larger pools -> lower rate.
+SPOT_INTERRUPT_RATE_PER_HR = {
+    "H100": 0.05, "H200": 0.05, "B200": 0.06,
+    "A100": 0.07, "MI300X": 0.08, "L4": 0.10, "A10G": 0.12,
+}
+DEFAULT_INTERRUPT_RATE = 0.05      # = old spot_checkpoint_cost default
+MAX_SPOT_INTERRUPT_RATE = 0.15     # ASSUMPTION: above this, rework + restarts make spot unreliable
+MIN_COMMIT_DAYS = 30               # ASSUMPTION: a job shorter than a month cannot use a 1yr/3yr commitment
+# ASSUMPTION: NimbusAI's 24/7 inference baseline is expected to run >= 3 years on the same
+# GPU class. Sensitivity at 12/24 months is printed by M3 (1yr wins below 36 months).
+SERVICE_LIFETIME_MONTHS = 36
+
+
+def spot_interrupt_rate(gpu_type: str | None) -> float:
+    """Per-hour spot interruption rate for a GPU type (default when unknown)."""
+    return SPOT_INTERRUPT_RATE_PER_HR.get(gpu_type or "", DEFAULT_INTERRUPT_RATE)
+
+
+def choose_reserved_term(expected_months: float, reserved_1yr_hr: float, reserved_3yr_hr: float) -> tuple:
+    """Pick the 1yr or 3yr commitment with the lower *effective* hourly rate.
+
+    A commitment is paid for whole terms, so if the workload only lives `expected_months`,
+    the effective rate is term_rate * paid_months / used_months. Ties go to '1yr' (less lock-in).
+    """
+    if expected_months <= 0:
+        return "1yr", reserved_1yr_hr
+    m = float(expected_months)
+    eff_1yr = reserved_1yr_hr * math.ceil(m / 12) * 12 / m
+    eff_3yr = reserved_3yr_hr * math.ceil(m / 36) * 36 / m
+    return ("3yr", eff_3yr) if eff_3yr < eff_1yr else ("1yr", eff_1yr)
+
+
+def reserved_monthly_cost(num_gpus: float, reserved_hr: float, days: float = 30) -> float:
+    """A commitment is billed 24h/day whether the GPU is busy or not."""
+    return num_gpus * 24 * days * reserved_hr
+
+
+def recommend_tier(hours_per_day: float, interruptible: bool, reserved_discount: float = 0.45, *,
+                   gpu_type: str | None = None, job_days: float | None = None,
+                   max_interrupt_rate: float = MAX_SPOT_INTERRUPT_RATE) -> str:
     """Pick a purchasing tier from a workload's duty cycle + interruptibility.
 
-    DOCUMENTED simple policy (instructor extension point — swap in your own):
-      - interruptible & not 24/7  -> 'spot'      (checkpoint and ride the discount)
-      - duty cycle >= break-even  -> 'reserved'  (steady, high utilization)
-      - otherwise                 -> 'on_demand' (spiky / low duty)
+    Policy (with only the first three args it behaves exactly like the original):
+      - interruptible & not 24/7            -> 'spot'      (checkpoint and ride the discount)
+          ... unless gpu_type is given and its spot interrupt rate > max_interrupt_rate
+      - duty cycle >= break-even            -> 'reserved'  (steady, high utilization)
+          ... unless job_days is given and < MIN_COMMIT_DAYS (one-off job, no commitment)
+      - otherwise                           -> 'on_demand' (spiky / low duty / short)
+    Pass reserved_discount from the chosen term (see choose_reserved_term) so the
+    break-even reflects the real 1yr/3yr rate of that GPU type.
     """
     duty = max(0.0, hours_per_day) / 24.0
     be = break_even_utilization(reserved_discount)
-    if interruptible and hours_per_day < 24:
+    spot_ok = gpu_type is None or spot_interrupt_rate(gpu_type) <= max_interrupt_rate
+    if interruptible and hours_per_day < 24 and spot_ok:
         return "spot"
-    if duty >= be:
+    commit_ok = job_days is None or job_days >= MIN_COMMIT_DAYS
+    if duty >= be and commit_ok:
         return "reserved"
     return "on_demand"
+
+
+def tier_matrix(catalog: dict, duty_hours=(4, 8, 12, 14, 16, 20, 24),
+                lifetime_months: float = SERVICE_LIFETIME_MONTHS) -> list:
+    """Policy matrix GPU type x duty cycle x interruptible -> tier (+term) for an ongoing job."""
+    rows = []
+    for gtype, c in catalog.items():
+        od = float(c["on_demand_hr"])
+        term, term_hr = choose_reserved_term(lifetime_months, float(c["reserved_1yr_hr"]),
+                                             float(c["reserved_3yr_hr"]))
+        disc = 1.0 - term_hr / od if od > 0 else 0.0
+        for interruptible in (True, False):
+            cells = {}
+            for h in duty_hours:
+                t = recommend_tier(h, interruptible, disc, gpu_type=gtype)
+                cells[h] = f"reserved-{term}" if t == "reserved" else t
+            rows.append({"gpu_type": gtype, "interruptible": interruptible,
+                         "break_even_h": round(break_even_utilization(disc) * 24, 1), "cells": cells})
+    return rows
 
 
 def spot_checkpoint_cost(
